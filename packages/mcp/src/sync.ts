@@ -12,6 +12,13 @@ export class SyncManager {
         this.snapshotManager = snapshotManager;
     }
 
+    /**
+     * Check if a codebase is being watched by a file watcher
+     */
+    private isCodebaseWatched(codebasePath: string): boolean {
+        return this.context.isWatching(codebasePath);
+    }
+
     public async handleSyncIndex(): Promise<void> {
         const syncStartTime = Date.now();
         console.log(`[SYNC-DEBUG] handleSyncIndex() called at ${new Date().toISOString()}`);
@@ -34,13 +41,19 @@ export class SyncManager {
         console.log(`[SYNC-DEBUG] Starting index sync for all ${indexedCodebases.length} codebases...`);
 
         try {
-            let totalStats = { added: 0, removed: 0, modified: 0 };
+            let totalStats = { added: 0, removed: 0, modified: 0, unchanged: 0 };
 
             for (let i = 0; i < indexedCodebases.length; i++) {
                 const codebasePath = indexedCodebases[i];
                 const codebaseStartTime = Date.now();
 
                 console.log(`[SYNC-DEBUG] [${i + 1}/${indexedCodebases.length}] Starting sync for codebase: '${codebasePath}'`);
+
+                // Skip codebases that have active file watchers (they sync in real-time)
+                if (this.isCodebaseWatched(codebasePath)) {
+                    console.log(`[SYNC-DEBUG] Skipping sync for '${codebasePath}' - has active file watcher`);
+                    continue;
+                }
 
                 // Check if codebase path still exists
                 try {
@@ -68,9 +81,10 @@ export class SyncManager {
                     totalStats.added += stats.added;
                     totalStats.removed += stats.removed;
                     totalStats.modified += stats.modified;
+                    totalStats.unchanged += stats.unchanged;
 
                     if (stats.added > 0 || stats.removed > 0 || stats.modified > 0) {
-                        console.log(`[SYNC] Sync complete for '${codebasePath}'. Added: ${stats.added}, Removed: ${stats.removed}, Modified: ${stats.modified} (${codebaseElapsed}ms)`);
+                        console.log(`[SYNC] Sync complete for '${codebasePath}'. Added: ${stats.added}, Removed: ${stats.removed}, Modified: ${stats.modified}, Unchanged chunks: ${stats.unchanged} (${codebaseElapsed}ms)`);
                     } else {
                         console.log(`[SYNC] No changes detected for '${codebasePath}' (${codebaseElapsed}ms)`);
                     }
@@ -97,9 +111,9 @@ export class SyncManager {
             }
 
             const totalElapsed = Date.now() - syncStartTime;
-            console.log(`[SYNC-DEBUG] Total sync stats across all codebases: Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
+            console.log(`[SYNC-DEBUG] Total sync stats across all codebases: Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}, Unchanged chunks: ${totalStats.unchanged}`);
             console.log(`[SYNC-DEBUG] Index sync completed for all codebases in ${totalElapsed}ms`);
-            console.log(`[SYNC] Index sync completed for all codebases. Total changes - Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}`);
+            console.log(`[SYNC] Index sync completed for all codebases. Total changes - Added: ${totalStats.added}, Removed: ${totalStats.removed}, Modified: ${totalStats.modified}, Unchanged chunks: ${totalStats.unchanged}`);
         } catch (error: any) {
             const totalElapsed = Date.now() - syncStartTime;
             console.error(`[SYNC-DEBUG] Error during index sync after ${totalElapsed}ms:`, error);

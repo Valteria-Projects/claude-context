@@ -40,12 +40,20 @@ export interface CodebaseInfoIndexing extends CodebaseInfoBase {
     indexingPercentage: number;  // Current progress percentage
 }
 
+// Watcher configuration stored with codebase
+export interface WatcherConfigSnapshot {
+    debounceMs?: number;
+    burstDebounceMs?: number;
+}
+
 // Indexed state - when indexing completed successfully
 export interface CodebaseInfoIndexed extends CodebaseInfoBase {
     status: 'indexed';
     indexedFiles: number;        // Number of files indexed
     totalChunks: number;         // Total number of chunks generated
     indexStatus: 'completed' | 'limit_reached';  // Status from indexing result
+    watcherEnabled?: boolean;    // Whether file watching is enabled for this codebase
+    watcherConfig?: WatcherConfigSnapshot; // Watcher configuration
 }
 
 // Index failed state - when indexing failed

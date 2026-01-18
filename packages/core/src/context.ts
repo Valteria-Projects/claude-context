@@ -22,6 +22,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
+import { FileWatcherManager, WatcherManagerConfig } from './sync/watcher-manager';
+import { WatcherConfig, WatcherStatus, AggregatedChanges } from './sync/watcher';
 
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
@@ -94,6 +96,7 @@ export interface ContextConfig {
     ignorePatterns?: string[];
     customExtensions?: string[]; // New: custom extensions from MCP
     customIgnorePatterns?: string[]; // New: custom ignore patterns from MCP
+    watcherManagerConfig?: WatcherManagerConfig; // File watcher configuration
 }
 
 export class Context {
@@ -103,6 +106,7 @@ export class Context {
     private supportedExtensions: string[];
     private ignorePatterns: string[];
     private synchronizers = new Map<string, FileSynchronizer>();
+    private watcherManager: FileWatcherManager;
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -144,6 +148,9 @@ export class Context {
         ];
         // Remove duplicates
         this.ignorePatterns = [...new Set(allIgnorePatterns)];
+
+        // Initialize file watcher manager
+        this.watcherManager = new FileWatcherManager(config.watcherManagerConfig);
 
         console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
         if (envCustomExtensions.length > 0) {
@@ -201,6 +208,92 @@ export class Context {
      */
     setSynchronizer(collectionName: string, synchronizer: FileSynchronizer): void {
         this.synchronizers.set(collectionName, synchronizer);
+    }
+
+    /**
+     * Get the file watcher manager instance
+     */
+    getWatcherManager(): FileWatcherManager {
+        return this.watcherManager;
+    }
+
+    /**
+     * Start watching a codebase for file changes
+     * When changes are detected, automatically triggers incremental reindexing
+     * @param codebasePath Path to the codebase to watch
+     * @param onReindexComplete Optional callback when reindexing completes
+     * @param config Optional watcher configuration
+     */
+    async startWatching(
+        codebasePath: string,
+        onReindexComplete?: (result: { added: number; removed: number; modified: number; unchanged: number }) => void,
+        config?: WatcherConfig
+    ): Promise<void> {
+        const watcherConfig: WatcherConfig = {
+            supportedExtensions: this.supportedExtensions,
+            ignorePatterns: this.ignorePatterns,
+            ...config,
+        };
+
+        const onChanges = async (changes: AggregatedChanges) => {
+            console.log(`[Context] File changes detected in ${codebasePath}, triggering reindex...`);
+            try {
+                const result = await this.reindexByChange(codebasePath);
+                console.log(`[Context] Reindex complete: ${result.added} added, ${result.removed} removed, ${result.modified} modified, ${result.unchanged} chunks unchanged`);
+                if (onReindexComplete) {
+                    onReindexComplete(result);
+                }
+            } catch (error) {
+                console.error(`[Context] Reindex failed for ${codebasePath}:`, error);
+            }
+        };
+
+        await this.watcherManager.startWatching(codebasePath, onChanges, watcherConfig);
+    }
+
+    /**
+     * Stop watching a codebase for file changes
+     * @param codebasePath Path to the codebase to stop watching
+     */
+    async stopWatching(codebasePath: string): Promise<void> {
+        await this.watcherManager.stopWatching(codebasePath);
+    }
+
+    /**
+     * Stop all file watchers
+     */
+    async stopAllWatchers(): Promise<void> {
+        await this.watcherManager.stopAll();
+    }
+
+    /**
+     * Check if a codebase is being watched
+     * @param codebasePath Path to the codebase to check
+     */
+    isWatching(codebasePath: string): boolean {
+        return this.watcherManager.isWatching(codebasePath);
+    }
+
+    /**
+     * Get the status of a file watcher for a codebase
+     * @param codebasePath Path to the codebase
+     */
+    getWatcherStatus(codebasePath: string): WatcherStatus | undefined {
+        return this.watcherManager.getWatcherStatus(codebasePath);
+    }
+
+    /**
+     * Get status of all file watchers
+     */
+    getAllWatcherStatuses(): Map<string, WatcherStatus> {
+        return this.watcherManager.getAllWatcherStatuses();
+    }
+
+    /**
+     * Get list of all watched codebase paths
+     */
+    getWatchedPaths(): string[] {
+        return this.watcherManager.getWatchedPaths();
     }
 
     /**
@@ -315,7 +408,7 @@ export class Context {
     async reindexByChange(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
-    ): Promise<{ added: number, removed: number, modified: number }> {
+    ): Promise<{ added: number, removed: number, modified: number, unchanged: number }> {
         const collectionName = this.getCollectionName(codebasePath);
         const synchronizer = this.synchronizers.get(collectionName);
 
@@ -338,10 +431,10 @@ export class Context {
         if (totalChanges === 0) {
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
-            return { added: 0, removed: 0, modified: 0 };
+            return { added: 0, removed: 0, modified: 0, unchanged: 0 };
         }
 
-        console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
+        console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified files.`);
 
         let processedChanges = 0;
         const updateProgress = (phase: string) => {
@@ -350,35 +443,74 @@ export class Context {
             progressCallback?.({ phase, current: processedChanges, total: totalChanges, percentage });
         };
 
+        // Track chunk-level stats
+        let totalChunksEmbedded = 0;
+        let totalChunksUnchanged = 0;
+        let totalChunksDeleted = 0;
+
         // Handle removed files
         for (const file of removed) {
             await this.deleteFileChunks(collectionName, file);
             updateProgress(`Removed ${file}`);
         }
 
-        // Handle modified files
+        // Handle modified files with chunk-level diffing
         for (const file of modified) {
-            await this.deleteFileChunks(collectionName, file);
-            updateProgress(`Deleted old chunks for ${file}`);
+            const fullPath = path.join(codebasePath, file);
+            try {
+                const content = await fs.promises.readFile(fullPath, 'utf-8');
+                const language = this.getLanguageFromExtension(path.extname(fullPath));
+                const newChunks = await this.codeSplitter.split(content, language, fullPath);
+
+                // Get chunk diff
+                const diff = await this.getChunkDiff(collectionName, file, newChunks);
+
+                // Delete only removed/changed chunks
+                if (diff.idsToDelete.length > 0) {
+                    await this.vectorDatabase.delete(collectionName, diff.idsToDelete);
+                    totalChunksDeleted += diff.idsToDelete.length;
+                }
+
+                // Process only new/changed chunks
+                if (diff.chunksToEmbed.length > 0) {
+                    await this.processChunkBatch(diff.chunksToEmbed, codebasePath);
+                    totalChunksEmbedded += diff.chunksToEmbed.length;
+                }
+
+                totalChunksUnchanged += diff.unchangedCount;
+
+                console.log(`[Context] 📝 ${file}: ${diff.chunksToEmbed.length} chunks to embed, ${diff.idsToDelete.length} to delete, ${diff.unchangedCount} unchanged`);
+                updateProgress(`Modified ${file}`);
+            } catch (error) {
+                console.warn(`[Context] ⚠️  Skipping modified file ${file}: ${error}`);
+                updateProgress(`Skipped ${file}`);
+            }
         }
 
-        // Handle added and modified files
-        const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
+        // Handle added files (full indexing)
+        const filesToIndex = added.map(f => path.join(codebasePath, f));
 
         if (filesToIndex.length > 0) {
-            await this.processFileList(
+            const result = await this.processFileList(
                 filesToIndex,
                 codebasePath,
                 (filePath, fileIndex, totalFiles) => {
                     updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`);
                 }
             );
+            totalChunksEmbedded += result.totalChunks;
         }
 
-        console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
+        console.log(`[Context] ✅ Re-indexing complete. Files: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
+        console.log(`[Context] 📊 Chunks: ${totalChunksEmbedded} embedded, ${totalChunksDeleted} deleted, ${totalChunksUnchanged} unchanged.`);
         progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
 
-        return { added: added.length, removed: removed.length, modified: modified.length };
+        return {
+            added: added.length,
+            removed: removed.length,
+            modified: modified.length,
+            unchanged: totalChunksUnchanged
+        };
     }
 
     private async deleteFileChunks(collectionName: string, relativePath: string): Promise<void> {
@@ -920,6 +1052,79 @@ export class Context {
         const combinedString = `${relativePath}:${startLine}:${endLine}:${content}`;
         const hash = crypto.createHash('sha256').update(combinedString, 'utf-8').digest('hex');
         return `chunk_${hash.substring(0, 16)}`;
+    }
+
+    /**
+     * Generate chunk ID from a CodeChunk object
+     * @param chunk The code chunk
+     * @param relativePath Relative path to the file
+     * @returns Hash-based unique ID
+     */
+    private generateChunkId(chunk: CodeChunk, relativePath: string): string {
+        return this.generateId(
+            relativePath,
+            chunk.metadata.startLine || 0,
+            chunk.metadata.endLine || 0,
+            chunk.content
+        );
+    }
+
+    /**
+     * Compute chunk-level diff to determine which chunks need embedding
+     * @param collectionName Name of the vector collection
+     * @param relativePath Relative path to the file
+     * @param newChunks Array of new code chunks from re-parsing the file
+     * @returns Object with chunks to embed, IDs to delete, and unchanged count
+     */
+    private async getChunkDiff(
+        collectionName: string,
+        relativePath: string,
+        newChunks: CodeChunk[]
+    ): Promise<{
+        chunksToEmbed: CodeChunk[];
+        idsToDelete: string[];
+        unchangedCount: number;
+    }> {
+        // Query existing chunks for this file
+        const escapedPath = relativePath.replace(/\\/g, '\\\\');
+        const existingResults = await this.vectorDatabase.query(
+            collectionName,
+            `relativePath == "${escapedPath}"`,
+            ['id']
+        );
+
+        // Get existing chunk IDs
+        const existingIds = new Set(
+            existingResults.map(r => r.id as string).filter(id => id)
+        );
+
+        // Generate IDs for new chunks
+        const newChunkMap = new Map<string, CodeChunk>();
+        for (const chunk of newChunks) {
+            const id = this.generateChunkId(chunk, relativePath);
+            newChunkMap.set(id, chunk);
+        }
+        const newIds = new Set(newChunkMap.keys());
+
+        // Compute diff
+        const idsToDelete: string[] = [];
+        for (const existingId of existingIds) {
+            if (!newIds.has(existingId)) {
+                idsToDelete.push(existingId);
+            }
+        }
+
+        const chunksToEmbed: CodeChunk[] = [];
+        let unchangedCount = 0;
+        for (const [id, chunk] of newChunkMap) {
+            if (existingIds.has(id)) {
+                unchangedCount++;
+            } else {
+                chunksToEmbed.push(chunk);
+            }
+        }
+
+        return { chunksToEmbed, idsToDelete, unchangedCount };
     }
 
     /**

@@ -30,6 +30,7 @@ import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.j
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
+import { WatcherHandlers } from "./watcher-handlers.js";
 
 class ContextMcpServer {
     private server: Server;
@@ -37,6 +38,7 @@ class ContextMcpServer {
     private snapshotManager: SnapshotManager;
     private syncManager: SyncManager;
     private toolHandlers: ToolHandlers;
+    private watcherHandlers: WatcherHandlers;
 
     constructor(config: ContextMcpConfig) {
         // Initialize MCP server
@@ -75,6 +77,7 @@ class ContextMcpServer {
         this.snapshotManager = new SnapshotManager();
         this.syncManager = new SyncManager(this.context, this.snapshotManager);
         this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
+        this.watcherHandlers = new WatcherHandlers(this.context, this.snapshotManager);
 
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
@@ -221,6 +224,58 @@ This tool is versatile and can be used before completing various tasks to retrie
                             required: ["path"]
                         }
                     },
+                    {
+                        name: "start_watching",
+                        description: `Start watching an indexed codebase for file changes. When files are added, modified, or removed, the index will automatically update within a few seconds. This provides real-time index synchronization without manual re-indexing.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: `ABSOLUTE path to the indexed codebase directory to watch.`
+                                },
+                                debounceMs: {
+                                    type: "number",
+                                    description: "Debounce time in milliseconds for normal changes (default: 1000ms). Changes are batched during this window before triggering reindexing.",
+                                    default: 1000
+                                },
+                                burstDebounceMs: {
+                                    type: "number",
+                                    description: "Debounce time in milliseconds during burst mode, e.g. git checkout (default: 5000ms). Used when many changes occur rapidly.",
+                                    default: 5000
+                                }
+                            },
+                            required: ["path"]
+                        }
+                    },
+                    {
+                        name: "stop_watching",
+                        description: `Stop watching a codebase for file changes. The index will no longer auto-update when files change.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: `ABSOLUTE path to the codebase directory to stop watching.`
+                                }
+                            },
+                            required: ["path"]
+                        }
+                    },
+                    {
+                        name: "get_watcher_status",
+                        description: `Get the status of file watchers. If a path is provided, shows status for that specific codebase. Otherwise, shows status of all active watchers.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: `Optional: ABSOLUTE path to a specific codebase to check watcher status for. If not provided, returns status of all active watchers.`
+                                }
+                            },
+                            required: []
+                        }
+                    },
                 ]
             };
         });
@@ -238,6 +293,12 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return await this.toolHandlers.handleClearIndex(args);
                 case "get_indexing_status":
                     return await this.toolHandlers.handleGetIndexingStatus(args);
+                case "start_watching":
+                    return await this.watcherHandlers.handleStartWatching(args);
+                case "stop_watching":
+                    return await this.watcherHandlers.handleStopWatching(args);
+                case "get_watcher_status":
+                    return await this.watcherHandlers.handleGetWatcherStatus(args);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);
@@ -259,6 +320,11 @@ This tool is versatile and can be used before completing various tasks to retrie
         // Start background sync after server is connected
         console.log('[SYNC-DEBUG] Initializing background sync...');
         this.syncManager.startBackgroundSync();
+
+        // Auto-start file watchers for codebases that had watchers enabled
+        console.log('[SYNC-DEBUG] Auto-starting file watchers...');
+        await this.watcherHandlers.autoStartWatchers();
+
         console.log('[SYNC-DEBUG] MCP server initialization complete');
     }
 }
